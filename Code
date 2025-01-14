@@ -1,0 +1,141 @@
+import os
+import requests
+import numpy as np
+import cv2
+from datetime import datetime, timedelta, timezone
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pyproj import Proj, Transformer, Geod
+
+
+def download_goes_images(base_url, output_folder, date_str, hours_range, minutes_range):
+    """Download GOES images from the specified URL and save to the output folder."""
+    os.makedirs(output_folder, exist_ok=True)  # Automatically create folder if it doesn't exist
+    
+    session = requests.Session()  # Reuse HTTP session for efficiency
+    for hour in hours_range:
+        for minute in minutes_range:
+            file_name = f"{date_str}{hour}{minute}_GOES16-ABI-FD-GEOCOLOR-21696x21696.jpg"
+            file_url = f"{base_url}{file_name}"
+            file_path = os.path.join(output_folder, file_name)
+            
+            if not os.path.exists(file_path):
+                try:
+                    response = session.get(file_url, stream=True)
+                    response.raise_for_status()  # Will raise HTTPError for bad status codes
+                    with open(file_path, "wb") as file:
+                        file.write(response.content)
+                    print(f"Downloaded {file_name}")
+                except requests.HTTPError:
+                    print(f"File not found: {file_name}")
+    session.close()  # Close the session after all downloads
+    return output_folder
+
+
+def lat_lon_to_pixel(lat, lon, img_shape):
+    """Convert latitude and longitude to pixel coordinates in the GOES-16 image."""
+    sat_height = 35786023.0  # Satellite height in meters
+    goes16_proj = Proj(proj="geos", h=sat_height, lon_0=-75.0, sweep="x")
+    
+    transformer = Transformer.from_crs("EPSG:4326", goes16_proj.srs, always_xy=True)
+    x, y = transformer.transform(lon, lat)
+    
+    x_pixel = int((x + sat_height) * (img_shape[1] / (2 * sat_height)))
+    y_pixel = int((sat_height - y) * (img_shape[0] / (2 * sat_height)))
+    
+    return x_pixel, y_pixel
+
+
+def calculate_cloud_cover(image_path, lat, lon):
+    """Calculate cloud cover percentage at the given latitude and longitude from the image."""
+    gray_image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if gray_image is None:
+        raise ValueError(f"Unable to load image: {image_path}")
+    
+    pixel_x, pixel_y = lat_lon_to_pixel(lat, lon, gray_image.shape)
+    if pixel_x < 0 or pixel_x >= gray_image.shape[1] or pixel_y < 0 or pixel_y >= gray_image.shape[0]:
+        raise ValueError("Lat/Lon point is outside the image bounds")
+    
+    threshold_value = 80  # Threshold for cloudy regions ---> Pixels with intensity values above 80 (on a scale of 0-255) will be classified as clouds
+    _, cloud_mask = cv2.threshold(gray_image, threshold_value, 255, cv2.THRESH_BINARY) # 255 is used because it represents the maximum intensity value in an 8-bit image  2^8 
+    
+    window_size = 5
+    x_min, x_max = max(0, pixel_x - window_size), min(gray_image.shape[1], pixel_x + window_size)
+    y_min, y_max = max(0, pixel_y - window_size), min(gray_image.shape[0], pixel_y + window_size)
+    
+    region = cloud_mask[y_min:y_max, x_min:x_max]
+    cloud_cover_percentage = np.sum(region == 255) / region.size * 100
+    return cloud_cover_percentage
+
+
+def get_bounding_box(lat, lon, radius_km):
+    """Get the bounding box coordinates (lat_min, lon_min, lat_max, lon_max) for a given radius."""
+    geod = Geod(ellps="WGS84")
+    lon_min, lat_min, _ = geod.fwd(lon, lat, 180, radius_km * 1000)  # 180° is west
+    lon_max, lat_max, _ = geod.fwd(lon, lat, 0, radius_km * 1000)  # 0° is east
+    return lat_min, lon_min, lat_max, lon_max
+
+
+def plot_cloud_cover_by_hour(cloud_cover_times, minutes_range, formatted_dayX_for_plot):
+    """Plot cloud cover data in a single figure with multiple subplots."""
+    plt.figure(figsize=(15, 6))
+    hours = ["00", "12", "18"]
+    colors = ['blue', 'green', 'red']
+    # Get current month in MM format
+    current_month = datetime.now().strftime("%m")
+
+    for i, hour in enumerate(hours):
+        plt.subplot(3, 1, i + 1)
+        sns.barplot(x=minutes_range, y=cloud_cover_times[hour], color=colors[i])
+        plt.title(f"CL-C (%) for HH = {hour} - day : {formatted_dayX_for_plot}{current_month}")
+        plt.xlabel("Minute (MM)")
+        plt.ylabel("CL-C (%)")
+        plt.grid(True)
+    
+    plt.tight_layout()  # To avoid overlap between subplots
+    plot_file = f"cloud_cover_00_12_18_{formatted_dayX_for_plot}{current_month}.jpg"
+    plt.savefig(plot_file, format="jpeg")
+    plt.show()
+    print(f"Saved cloud cover plot to: {plot_file}")
+
+
+def main():
+    # FD (Full Disk) 
+    """
+     GEOCOLOR: This product combines multiple spectral bands, including visible and infrared bands,
+     to create an image that simulates what the Earth looks like from space, providing high-definition, true-color views.
+    """ 
+    base_url = "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/"
+    output_folder = "goes_images" # C:\Users\...\goes_images
+    lat, lon = 48.5856, -68.1901  # Target coordinates
+    radius_km = 5  # Radius in kilometers
+    dayX = datetime.now(timezone.utc) - timedelta(days=6)
+    formatted_dayX = dayX.strftime("%Y0%d")
+    formatted_dayX_for_plot = dayX.strftime("%Y%d")
+    
+    hours_range = [f"{h:02d}" for h in range(0, 24)]
+    minutes_range = ['00', '10', '20', '30', '40', '50']
+    
+    lat_min, lon_min, lat_max, lon_max = get_bounding_box(lat, lon, radius_km)
+    print(f"Bounding box for {radius_km} km radius: ({lat_min}, {lon_min}) to ({lat_max}, {lon_max})")
+    
+    download_goes_images(base_url, output_folder, formatted_dayX, hours_range, minutes_range)
+    
+    cloud_cover_times = { "00": [], "12": [], "18": [] }
+    for hour in ['00', '12', '18']:
+        for minute in minutes_range:
+            file_name = f"{formatted_dayX}{hour}{minute}_GOES16-ABI-FD-GEOCOLOR-21696x21696.jpg"
+            file_path = os.path.join(output_folder, file_name)
+            if os.path.exists(file_path):
+                try:
+                    cloud_cover = calculate_cloud_cover(file_path, lat, lon)
+                    cloud_cover_times[hour].append(cloud_cover)
+                except Exception as e:
+                    print(f"Error processing {file_name}: {e}")
+    
+    plot_cloud_cover_by_hour(cloud_cover_times, minutes_range, formatted_dayX_for_plot)
+
+
+if __name__ == "__main__":
+    main()
+
